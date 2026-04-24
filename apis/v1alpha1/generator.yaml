@@ -258,6 +258,8 @@ ignore:
     - VpnConcentrator
     - VpnConnection
     - VpnGateway    
+    - SecondaryNetwork
+    - SecondarySubnet
 
 operations:
   AllocateAddress:
@@ -1032,6 +1034,11 @@ resources:
     update_operation:
       custom_method_name: customUpdateTransitGateway
   TransitGatewayVpcAttachment:
+    updateable:
+      when:
+        - path: Status.State
+          in:
+            - available
     renames:
       operations:
         CreateTransitGatewayVpcAttachment:
