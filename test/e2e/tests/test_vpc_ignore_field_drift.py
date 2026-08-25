@@ -15,10 +15,15 @@
 exercised against the EC2 VPC resource and its spec.tags field.
 
 This is the runtime feature under aws-controllers-k8s/runtime#256. The
-IgnoreFieldDrift feature gate is Alpha and disabled by default, so the test
-enables it on the deployed controller for the duration of the module and
-restores the prior value afterwards. EC2 is one of the controllers the runtime
+IgnoreFieldDrift feature gate is Alpha and disabled by default, so the tests
+enable it on the deployed controller. EC2 is one of the controllers the runtime
 presubmit regenerates and e2e-tests, so this coverage runs on runtime PRs.
+
+Enabling the gate restarts the shared controller Deployment, which is a
+cluster-wide side effect in a suite that runs 32 xdist workers in parallel: a
+restart mid-run can time out any other worker waiting on ACK.ResourceSynced.
+The gate is therefore turned on exactly once per run and never turned back
+off -- see ignore_field_drift_enabled for why that is both safe and necessary.
 """
 
 import logging
@@ -96,14 +101,28 @@ def _set_feature_gates_env(value: str):
     _wait_for_rollout()
 
 
-def _merge_gate(existing: str, gate: str, enabled: bool) -> str:
-    """Returns a FEATURE_GATES string with `gate` set to `enabled`, preserving
-    any other gates already present."""
+def _gate_enabled_in_spec() -> bool:
+    """Returns True if the controller Deployment's FEATURE_GATES env var already
+    has FEATURE_GATE turned on. Read from the Deployment spec (not the running
+    pod), so it reflects a patch that has been accepted but is still rolling."""
+    pairs = _parse_gates(_get_feature_gates_env())
+    return pairs.get(FEATURE_GATE) == "true"
+
+
+def _parse_gates(existing: str) -> dict:
+    """Parses a FEATURE_GATES string ("A=true,B=false") into a dict."""
     pairs = {}
     for part in filter(None, (p.strip() for p in existing.split(","))):
         if "=" in part:
             k, v = part.split("=", 1)
             pairs[k.strip()] = v.strip()
+    return pairs
+
+
+def _merge_gate(existing: str, gate: str, enabled: bool) -> str:
+    """Returns a FEATURE_GATES string with `gate` set to `enabled`, preserving
+    any other gates already present."""
+    pairs = _parse_gates(existing)
     pairs[gate] = "true" if enabled else "false"
     return ",".join(f"{k}={v}" for k, v in pairs.items())
 
@@ -140,15 +159,47 @@ def ec2_client():
     return boto3.client("ec2", get_region())
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def ignore_field_drift_enabled():
-    """Enables the IgnoreFieldDrift feature gate on the controller for the
-    duration of the module, then restores the prior FEATURE_GATES value."""
-    original = _get_feature_gates_env()
-    _set_feature_gates_env(_merge_gate(original, FEATURE_GATE, True))
+    """Turns the IgnoreFieldDrift feature gate on for the run, exactly once, and
+    deliberately never turns it back off.
+
+    Session scope is per WORKER, not per run: pytest-xdist distributes
+    individual tests across 32 worker processes, so a fixture at any scope is
+    instantiated once in every worker that happens to pick up a test from this
+    file. A module-scoped enable/restore pair therefore rolled the shared
+    controller Deployment up to six times in one run (three workers x
+    enable + restore), and each restart could time out an unrelated worker
+    waiting on ACK.ResourceSynced.
+
+    Two properties keep this to a single restart:
+
+      - Check-then-set. A worker that finds the gate already on in the
+        Deployment spec skips the patch. Concurrent workers that both observe it
+        off compute the same FEATURE_GATES string from the same starting value,
+        so the second patch leaves the pod template byte-identical, does not bump
+        the Deployment generation, and does not trigger a second rollout. That
+        makes an explicit cross-process lock unnecessary.
+
+      - No restore. Restoring would cost a second rollout, and a teardown in one
+        worker would disable the gate underneath a drift test still running in
+        another. Leaving it on is safe because the gate is inert unless a
+        resource carries the ignore-field-drift annotation, which only this
+        file's resources do; every other test in the suite behaves identically
+        with it on. The kind cluster is torn down at the end of the run, so
+        nothing outlives it.
+
+    One rollout mid-run is still a shared-cluster hiccup. Removing it entirely
+    means enabling the gate at controller setup time (FEATURE_GATES in
+    test-infra's controller-setup.sh, as IAMRoleSelector already does), after
+    which this fixture becomes a no-op check.
+    """
+    if not _gate_enabled_in_spec():
+        _set_feature_gates_env(_merge_gate(_get_feature_gates_env(), FEATURE_GATE, True))
+    # Whether we patched or another worker did, do not hand out the fixture
+    # until the controller serving the gate is actually up.
+    _wait_for_rollout()
     yield
-    # Restore exactly what was there before (which may be "").
-    _set_feature_gates_env(original)
 
 
 @pytest.fixture
