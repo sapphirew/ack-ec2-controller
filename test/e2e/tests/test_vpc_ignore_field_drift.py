@@ -253,11 +253,15 @@ def ignore_field_drift_vpc(request):
 
     yield (ref, cr)
 
-    try:
-        _, deleted = k8s.delete_custom_resource(ref, 3, 10)
-        assert deleted
-    except:
-        pass
+    # A teardown failure must not be silent: a swallowed assertion here means a
+    # leaked VPC or CR passes unnoticed, which is exactly the class of leak that
+    # exhausts the bootstrap cleanup retries later in the run.
+    #
+    # 60s rather than the more common 30s: a VPC CR whose delete is queued behind
+    # a busy controller routinely needs more than 30s to clear its finalizer, and
+    # timing out here would report a leak that is merely slow.
+    _, deleted = k8s.delete_custom_resource(ref, 6, 10)
+    assert deleted, f"CR {ref.name} was not deleted within 60s; possible leak"
 
 
 def _user_tags(vpc: dict) -> dict:
@@ -281,21 +285,30 @@ def _dns_support_enabled(ec2_client, vpc_id: str) -> bool:
 @service_marker
 class TestVpcIgnoreFieldDrift:
     """Verifies the services.k8s.aws/ignore-field-drift annotation on an EC2
-    VPC across the field shapes the runtime treats differently:
+    VPC across the field shapes and drift sources that matter:
 
     - test_tags_drift_ignored: an ignored list-of-objects field (spec.tags) --
-      an externally-added element survives.
-    - test_scalar_field_drift_ignored: an ignored scalar leaf
-      (spec.enableDNSSupport) whose Delta path matches the ignored path exactly.
-    - test_nested_field_under_ignored_parent: drift on a nested child of an
-      ignored parent (a tag's value under the ignored spec.tags), which the
-      runtime matches by path prefix rather than exact equality.
+      an externally-ADDED element survives, and an edit to the declared element
+      is retained without being pushed.
+    - test_scalar_external_drift_ignored: an ignored scalar leaf
+      (spec.enableDNSSupport) whose Delta path matches the ignored path exactly
+      -- an external flip survives.
+    - test_scalar_spec_edit_not_pushed: the same scalar, but the edit is made
+      while AWS still holds a different value, so declining to push it is
+      observable. Split from the test above because the field is boolean: after
+      an external flip, spec and AWS agree and the assertion would be vacuous.
+    - test_declared_tag_value_drift_ignored: an externally-changed VALUE on a
+      declared tag key -- the case tags.Sync would actively revert.
 
     In every case the controller still applies the declared value at create but
     stops reconciling drift on the ignored path: external changes survive, the
     resource stays Synced, and an edit to the ignored field is retained in the
     spec but not pushed to AWS. This mirrors the iam-controller Role coverage
-    for the same runtime feature (community#2367)."""
+    for the same runtime feature (community#2367).
+
+    None of these exercise the runtime's path-PREFIX match: every Delta path here
+    equals its annotation path. Prefix matching needs a delta subject deeper than
+    the annotation, which none of VPC's ignorable fields produce."""
 
     def test_tags_drift_ignored(
         self, ec2_client, ignore_field_drift_enabled, ignore_field_drift_vpc,
@@ -318,59 +331,67 @@ class TestVpcIgnoreFieldDrift:
             Resources=[vpc_id],
             Tags=[{"Key": "external", "Value": "managed-elsewhere"}],
         )
-        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+        # finally, not a trailing cleanup call: an assertion failure below would
+        # otherwise skip it and leave the out-of-band tag behind.
+        try:
+            time.sleep(MODIFY_WAIT_AFTER_SECONDS)
 
-        # The externally-added tag must survive: ACK does not reconcile drift on
-        # spec.tags, so it does not call DeleteTags for it.
-        tag_map = _user_tags(ec2_validator.get_vpc(vpc_id))
-        assert tag_map.get("external") == "managed-elsewhere", (
-            "controller removed an externally-managed tag despite "
-            "ignore-field-drift on spec.tags"
-        )
-        assert tag_map.get("team") == "payments"
+            # The externally-added tag must survive: ACK does not reconcile drift
+            # on spec.tags, so it does not call DeleteTags for it.
+            tag_map = _user_tags(ec2_validator.get_vpc(vpc_id))
+            assert tag_map.get("external") == "managed-elsewhere", (
+                "controller removed an externally-managed tag despite "
+                "ignore-field-drift on spec.tags"
+            )
+            assert tag_map.get("team") == "payments"
 
-        # The resource stays Synced even though spec.tags (team) differs from the
-        # live AWS tag set (team + external).
-        assert k8s.wait_on_condition(
-            ref, "ACK.ResourceSynced", "True",
-            wait_periods=6, period_length=10,
-        )
+            # The resource stays Synced even though spec.tags (team) differs from
+            # the live AWS tag set (team + external).
+            assert k8s.wait_on_condition(
+                ref, "ACK.ResourceSynced", "True",
+                wait_periods=6, period_length=10,
+            )
 
-        # Editing spec.tags while ignored is retained in the spec but NOT pushed
-        # to AWS: patch the CR to a different tag value and confirm the live tags
-        # are unchanged.
-        updates = {"spec": {"tags": [{"key": "team", "value": "changed"}]}}
-        k8s.patch_custom_resource(ref, updates)
-        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+            # Editing spec.tags while ignored is retained in the spec but NOT
+            # pushed to AWS: patch the CR to a different tag value and confirm the
+            # live tags are unchanged.
+            updates = {"spec": {"tags": [{"key": "team", "value": "changed"}]}}
+            k8s.patch_custom_resource(ref, updates)
+            time.sleep(MODIFY_WAIT_AFTER_SECONDS)
 
-        tag_map = _user_tags(ec2_validator.get_vpc(vpc_id))
-        # external tag still present (never removed)...
-        assert tag_map.get("external") == "managed-elsewhere"
-        # ...and the edited value was NOT pushed (team still "payments").
-        assert tag_map.get("team") == "payments"
+            tag_map = _user_tags(ec2_validator.get_vpc(vpc_id))
+            # external tag still present (never removed)...
+            assert tag_map.get("external") == "managed-elsewhere"
+            # ...and the edited value was NOT pushed (team still "payments").
+            assert tag_map.get("team") == "payments"
 
-        # The declared value is retained in the CR spec (retain semantics).
-        latest = k8s.get_resource(ref)
-        spec_tags = {t["key"]: t["value"] for t in latest["spec"].get("tags", [])}
-        assert spec_tags.get("team") == "changed"
-
-        # Clean up the out-of-band tag so teardown deletes cleanly.
-        ec2_client.delete_tags(
-            Resources=[vpc_id],
-            Tags=[{"Key": "external"}],
-        )
+            # The declared value is retained in the CR spec (retain semantics).
+            latest = k8s.get_resource(ref)
+            spec_tags = {t["key"]: t["value"] for t in latest["spec"].get("tags", [])}
+            assert spec_tags.get("team") == "changed"
+        finally:
+            ec2_client.delete_tags(
+                Resources=[vpc_id],
+                Tags=[{"Key": "external"}],
+            )
 
     @pytest.mark.parametrize(
         "ignore_field_drift_vpc",
         [{"ignore_paths": "spec.enableDNSSupport", "enable_dns_support": "False"}],
         indirect=True,
     )
-    def test_scalar_field_drift_ignored(
+    def test_scalar_external_drift_ignored(
         self, ec2_client, ignore_field_drift_enabled, ignore_field_drift_vpc,
     ):
         """Ignored scalar leaf: spec.enableDNSSupport. Its Delta path
         (Spec.EnableDNSSupport) equals the ignored path exactly, so this
-        exercises the exact-match branch of the runtime's path filtering."""
+        exercises the exact-match branch of the runtime's path filtering.
+
+        This half covers EXTERNAL drift. The spec-edit half is a separate test:
+        the field is boolean, so once the external actor has flipped the live
+        value to True a subsequent spec edit to True makes spec and AWS agree,
+        leaving no delta to suppress and nothing to assert.
+        """
         (ref, cr) = ignore_field_drift_vpc
         vpc_id = cr["status"]["vpcID"]
         ec2_validator = EC2Validator(ec2_client)
@@ -390,6 +411,8 @@ class TestVpcIgnoreFieldDrift:
 
         # The external value must survive: ACK does not reconcile drift on the
         # ignored scalar, so it does not call ModifyVpcAttribute to undo it.
+        # Non-vacuous: spec says False, AWS says True, and only drift suppression
+        # keeps it that way.
         assert _dns_support_enabled(ec2_client, vpc_id) is True, (
             "controller reverted an externally-changed enableDNSSupport despite "
             "ignore-field-drift on spec.enableDNSSupport"
@@ -402,27 +425,84 @@ class TestVpcIgnoreFieldDrift:
             wait_periods=6, period_length=10,
         )
 
-        # Editing the ignored scalar in the spec is retained but NOT pushed to
-        # AWS: patch to a new value and confirm the live attribute is unchanged.
+    @pytest.mark.parametrize(
+        "ignore_field_drift_vpc",
+        [{"ignore_paths": "spec.enableDNSSupport", "enable_dns_support": "False"}],
+        indirect=True,
+    )
+    def test_scalar_spec_edit_not_pushed(
+        self, ec2_client, ignore_field_drift_enabled, ignore_field_drift_vpc,
+    ):
+        """Editing an ignored scalar is retained in the spec but never pushed to
+        AWS.
+
+        The edit is made while the live value still DIFFERS from the edited one,
+        which is what makes the assertion meaningful: the controller has a real
+        delta it could act on (spec True vs AWS False) and must decline to.
+        Asserting this after an external flip to True would be vacuous, since
+        spec and AWS would already agree.
+
+        Distinct from the spec.tags edit case: enableDNSSupport is pushed by a
+        ModifyVpcAttribute call in the controller's custom update path, not by
+        tags.Sync, so suppression has to hold for that path too.
+        """
+        (ref, cr) = ignore_field_drift_vpc
+        vpc_id = cr["status"]["vpcID"]
+        ec2_validator = EC2Validator(ec2_client)
+
+        # Baseline: created with enableDNSSupport=false and applied at create.
+        ec2_validator.assert_vpc(vpc_id)
+        assert _dns_support_enabled(ec2_client, vpc_id) is False
+        condition.assert_synced(ref)
+
+        # Edit the ignored scalar to a value AWS does NOT currently hold.
         k8s.patch_custom_resource(ref, {"spec": {"enableDNSSupport": True}})
         time.sleep(MODIFY_WAIT_AFTER_SECONDS)
 
-        assert _dns_support_enabled(ec2_client, vpc_id) is True
+        # The edit must not reach AWS: the field is ignored, so no
+        # ModifyVpcAttribute is issued and the live value stays False.
+        assert _dns_support_enabled(ec2_client, vpc_id) is False, (
+            "controller pushed an edit to spec.enableDNSSupport despite "
+            "ignore-field-drift on that field"
+        )
+
+        # ...and the declared value is retained in the CR spec (retain semantics).
         latest = k8s.get_resource(ref)
         assert latest["spec"].get("enableDNSSupport") is True
+
+        # The resource stays Synced even though spec (true) differs from the live
+        # attribute (false).
+        assert k8s.wait_on_condition(
+            ref, "ACK.ResourceSynced", "True",
+            wait_periods=6, period_length=10,
+        )
 
     @pytest.mark.parametrize(
         "ignore_field_drift_vpc",
         [{"ignore_paths": "spec.tags"}],
         indirect=True,
     )
-    def test_nested_field_under_ignored_parent(
+    def test_declared_tag_value_drift_ignored(
         self, ec2_client, ignore_field_drift_enabled, ignore_field_drift_vpc,
     ):
-        """Drift on a nested child of an ignored parent: the declared tag's
-        value (Delta path Spec.Tags.N.Value) changes externally while only the
-        parent spec.tags is ignored. The runtime must match this by path prefix,
-        so the child drift is ignored too."""
+        """Drift on the VALUE of a tag key the CR declares, rather than on an
+        externally-added key.
+
+        Materially different from test_tags_drift_ignored: an added key is one
+        tags.Sync would leave alone anyway, whereas a changed value on a declared
+        key is one it would actively revert, so this is the case where drift
+        suppression does the real work.
+
+        Note this does NOT exercise prefix matching. The generated delta compares
+        tags as a whole (pkg/resource/vpc/delta.go emits a single
+        delta.Add("Spec.Tags", ...) via MapStringStringEqual), so the Delta path
+        is exactly Spec.Tags and Path.ContainsFold("spec.tags") matches by
+        segment equality. Prefix matching needs a Delta path DEEPER than the
+        annotation -- a nested struct member for which code-gen emits a
+        Spec.Parent.Child subject -- and per-element paths like Spec.Tags.N.Value
+        neither exist in the delta nor are expressible as an annotation
+        (isValidFieldPath rejects indices).
+        """
         (ref, cr) = ignore_field_drift_vpc
         vpc_id = cr["status"]["vpcID"]
         ec2_validator = EC2Validator(ec2_client)
@@ -432,20 +512,19 @@ class TestVpcIgnoreFieldDrift:
         assert _user_tags(ec2_validator.get_vpc(vpc_id)).get("team") == "payments"
         condition.assert_synced(ref)
 
-        # An external actor overwrites the VALUE of the declared tag key (not a
-        # new key). This is drift on a nested child (spec.tags[].value) of the
-        # ignored parent spec.tags.
+        # An external actor overwrites the VALUE of the declared tag key, rather
+        # than adding a new key.
         ec2_client.create_tags(
             Resources=[vpc_id],
             Tags=[{"Key": "team", "Value": "external-override"}],
         )
         time.sleep(MODIFY_WAIT_AFTER_SECONDS)
 
-        # The externally-changed value must survive: ACK does not reconcile the
-        # child of the ignored parent back to the spec value (payments).
+        # The externally-changed value must survive: ACK does not revert a
+        # declared key's value back to the spec value (payments).
         assert _user_tags(ec2_validator.get_vpc(vpc_id)).get("team") == "external-override", (
             "controller reverted an externally-changed tag value despite "
-            "ignore-field-drift on the parent spec.tags"
+            "ignore-field-drift on spec.tags"
         )
 
         # The resource stays Synced even though the spec tag value (payments)
