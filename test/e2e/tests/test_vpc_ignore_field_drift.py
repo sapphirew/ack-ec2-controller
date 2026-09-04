@@ -44,7 +44,6 @@ RESOURCE_PLURAL = "vpcs"
 PRIMARY_CIDR_DEFAULT = "10.0.0.0/16"
 
 CREATE_WAIT_AFTER_SECONDS = 15
-MODIFY_WAIT_AFTER_SECONDS = 20
 DELETE_WAIT_AFTER_SECONDS = 10
 
 # Controller deployment coordinates in the kind test cluster (see
@@ -55,6 +54,28 @@ CONTROLLER_CONTAINER = "controller"
 FEATURE_GATE = "IgnoreFieldDrift"
 # Generous window for the new pod to roll out and take over reconciliation.
 ROLLOUT_WAIT_SECONDS = 120
+
+# How long to wait for a resource to reach ACK.ResourceSynced=True (120s).
+SYNC_WAIT_PERIODS = 12
+SYNC_PERIOD_LENGTH = 10
+
+# An inert annotation patched onto the CR purely to trigger a reconcile. An
+# out-of-band AWS change produces no watch event, and this controller's resync
+# period is the runtime default of 10 hours -- config/controller/deployment.yaml
+# (what the e2e job deploys via kustomize) passes no --reconcile-*-resync-seconds
+# override and VPC's RequeueOnSuccessSeconds() is 0, so getResyncPeriod falls
+# through to defaultResyncPeriod. Without an explicit nudge the controller would
+# not look at the resource again for the rest of the run, and any assertion about
+# what it did with the drift would be vacuous -- it would hold identically with
+# the feature removed.
+#
+# Touching an annotation suffices because the runtime adds
+# AnnotationChangedPredicate to the event filter whenever the IgnoreFieldDrift
+# gate is on (runtime reconciler.go, SetupWithManager); the default filter is
+# GenerationChangedPredicate alone, which an annotation edit would not satisfy.
+# Keeping the probe off the spec means the only delta the reconcile sees is the
+# external drift itself.
+RECONCILE_PROBE_ANNOTATION = "e2e.test.ack.aws.dev/reconcile-probe"
 
 
 def _apps_client():
@@ -251,6 +272,18 @@ def ignore_field_drift_vpc(request):
     assert cr is not None
     assert k8s.get_resource_exists(ref)
 
+    # wait_resource_consumed_by_controller returns as soon as the resource has
+    # any .status at all, which is the first status write and can predate
+    # status.vpcID. Every test below reads vpcID out of the CR this fixture
+    # yields, so a snapshot taken at that moment gives them a KeyError they
+    # cannot recover from. Wait for a real reconcile, then re-read.
+    assert k8s.wait_on_condition(
+        ref, "ACK.ResourceSynced", "True",
+        wait_periods=SYNC_WAIT_PERIODS, period_length=SYNC_PERIOD_LENGTH,
+    ), f"VPC {resource_name} never reached ACK.ResourceSynced=True"
+    cr = k8s.get_resource(ref)
+    assert cr["status"]["vpcID"]
+
     yield (ref, cr)
 
     # A teardown failure must not be silent: a swallowed assertion here means a
@@ -280,6 +313,47 @@ def _dns_support_enabled(ec2_client, vpc_id: str) -> bool:
         VpcId=vpc_id, Attribute="enableDnsSupport",
     )
     return resp["EnableDnsSupport"]["Value"]
+
+
+def _await_reconcile_after(ref, synced_before, what: str):
+    """Blocks until a reconcile that STARTED after `synced_before` has completed
+    with ACK.ResourceSynced=True.
+
+    ACK rewrites ACK.ResourceSynced.lastTransitionTime on every reconcile, so a
+    strictly newer timestamp is proof the controller looked at the resource again
+    rather than the test reading a condition left over from an earlier reconcile.
+    A plain wait_on_condition cannot make that distinction: it returns on its
+    first poll off whatever is already there, which after create is a stale
+    Synced=True, so it passes without the controller having done anything.
+
+    Doubles as the "stays Synced despite the drift" assertion -- it requires the
+    fresh reconcile to have concluded Synced=True.
+    """
+    assert k8s.wait_on_condition_after(
+        ref, "ACK.ResourceSynced", "True",
+        last_transition_after=synced_before,
+        wait_periods=SYNC_WAIT_PERIODS, period_length=SYNC_PERIOD_LENGTH,
+    ), f"no reconcile completed with ACK.ResourceSynced=True after {what}"
+
+
+def _force_reconcile_after(ref, synced_before, what: str):
+    """Triggers a reconcile via the inert probe annotation, then waits for it.
+
+    For drift applied out-of-band on the AWS side, which generates no watch
+    event -- see RECONCILE_PROBE_ANNOTATION. Not needed after patching .spec,
+    which bumps metadata.generation and queues a reconcile on its own; use
+    _await_reconcile_after directly there.
+
+    The probe value is a timestamp rather than a constant so that calling this
+    twice within one test really changes the annotation. Re-patching an identical
+    value would leave the object unchanged, fire no event, and silently reduce
+    the wait below to a no-op against the previous reconcile.
+    """
+    k8s.patch_custom_resource(
+        ref,
+        {"metadata": {"annotations": {RECONCILE_PROBE_ANNOTATION: str(time.time())}}},
+    )
+    _await_reconcile_after(ref, synced_before, what)
 
 
 @service_marker
@@ -325,6 +399,9 @@ class TestVpcIgnoreFieldDrift:
         # The resource is Synced after create.
         condition.assert_synced(ref)
 
+        synced_before = condition.get_synced_last_transition_time(ref)
+        assert synced_before is not None
+
         # An external actor adds a tag ACK does not know about (the dynamic /
         # SCP-managed tag from the motivating use case).
         ec2_client.create_tags(
@@ -334,10 +411,25 @@ class TestVpcIgnoreFieldDrift:
         # finally, not a trailing cleanup call: an assertion failure below would
         # otherwise skip it and leave the out-of-band tag behind.
         try:
-            time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+            # Precondition: AWS really reports the added tag before the controller
+            # is asked to look. If the forced reconcile raced ahead of CreateTags,
+            # sdkFind would see the original tag set, find no drift, and the
+            # assertion below would pass for an unrelated reason.
+            assert _user_tags(
+                ec2_validator.get_vpc(vpc_id)
+            ).get("external") == "managed-elsewhere", (
+                "out-of-band CreateTags did not take effect"
+            )
 
-            # The externally-added tag must survive: ACK does not reconcile drift
-            # on spec.tags, so it does not call DeleteTags for it.
+            # Nothing else will make the controller look (10h resync, no watch
+            # event). This also asserts the resource stays Synced even though
+            # spec.tags (team) differs from the live set (team + external).
+            _force_reconcile_after(
+                ref, synced_before, "the out-of-band tag was added",
+            )
+
+            # Only now is this meaningful: the controller examined the resource
+            # and declined to call DeleteTags for the externally-added tag.
             tag_map = _user_tags(ec2_validator.get_vpc(vpc_id))
             assert tag_map.get("external") == "managed-elsewhere", (
                 "controller removed an externally-managed tag despite "
@@ -345,19 +437,18 @@ class TestVpcIgnoreFieldDrift:
             )
             assert tag_map.get("team") == "payments"
 
-            # The resource stays Synced even though spec.tags (team) differs from
-            # the live AWS tag set (team + external).
-            assert k8s.wait_on_condition(
-                ref, "ACK.ResourceSynced", "True",
-                wait_periods=6, period_length=10,
-            )
-
             # Editing spec.tags while ignored is retained in the spec but NOT
             # pushed to AWS: patch the CR to a different tag value and confirm the
             # live tags are unchanged.
+            synced_before_edit = condition.get_synced_last_transition_time(ref)
+            assert synced_before_edit is not None
             updates = {"spec": {"tags": [{"key": "team", "value": "changed"}]}}
             k8s.patch_custom_resource(ref, updates)
-            time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+            # This patch bumps metadata.generation, so a reconcile is queued --
+            # but waiting on a fixed sleep would not establish it had finished.
+            _await_reconcile_after(
+                ref, synced_before_edit, "the spec edit to the ignored field",
+            )
 
             tag_map = _user_tags(ec2_validator.get_vpc(vpc_id))
             # external tag still present (never removed)...
@@ -402,27 +493,36 @@ class TestVpcIgnoreFieldDrift:
         assert _dns_support_enabled(ec2_client, vpc_id) is False
         condition.assert_synced(ref)
 
+        synced_before = condition.get_synced_last_transition_time(ref)
+        assert synced_before is not None
+
         # An external actor flips the attribute on AWS. Without ignore-field-drift
         # the controller would reconcile it back to the spec value (false).
         ec2_client.modify_vpc_attribute(
             VpcId=vpc_id, EnableDnsSupport={"Value": True},
         )
-        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
 
-        # The external value must survive: ACK does not reconcile drift on the
-        # ignored scalar, so it does not call ModifyVpcAttribute to undo it.
-        # Non-vacuous: spec says False, AWS says True, and only drift suppression
-        # keeps it that way.
+        # Precondition: the flip is visible on AWS before the controller looks,
+        # so a race with ModifyVpcAttribute cannot make this pass for the wrong
+        # reason.
+        assert _dns_support_enabled(ec2_client, vpc_id) is True, (
+            "out-of-band ModifyVpcAttribute did not take effect"
+        )
+
+        # Nothing else will make the controller look (10h resync, no watch event).
+        # This also asserts it stays Synced even though spec (false) differs from
+        # the live attribute (true).
+        _force_reconcile_after(
+            ref, synced_before, "the external enableDNSSupport flip",
+        )
+
+        # Only now is this meaningful: the controller examined the resource and
+        # declined to call ModifyVpcAttribute to undo the flip. Non-vacuous in the
+        # other sense too -- spec says False, AWS says True, so only drift
+        # suppression keeps it that way.
         assert _dns_support_enabled(ec2_client, vpc_id) is True, (
             "controller reverted an externally-changed enableDNSSupport despite "
             "ignore-field-drift on spec.enableDNSSupport"
-        )
-
-        # The resource stays Synced even though spec (false) differs from the
-        # live attribute (true).
-        assert k8s.wait_on_condition(
-            ref, "ACK.ResourceSynced", "True",
-            wait_periods=6, period_length=10,
         )
 
     @pytest.mark.parametrize(
@@ -455,9 +555,19 @@ class TestVpcIgnoreFieldDrift:
         assert _dns_support_enabled(ec2_client, vpc_id) is False
         condition.assert_synced(ref)
 
+        synced_before = condition.get_synced_last_transition_time(ref)
+        assert synced_before is not None
+
         # Edit the ignored scalar to a value AWS does NOT currently hold.
         k8s.patch_custom_resource(ref, {"spec": {"enableDNSSupport": True}})
-        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+
+        # The patch bumps metadata.generation, so a reconcile is queued -- but a
+        # fixed sleep would not establish that it had finished, and the assertion
+        # below is only meaningful once it has. Also asserts the resource stays
+        # Synced even though spec (true) differs from the live attribute (false).
+        _await_reconcile_after(
+            ref, synced_before, "the spec edit to the ignored scalar",
+        )
 
         # The edit must not reach AWS: the field is ignored, so no
         # ModifyVpcAttribute is issued and the live value stays False.
@@ -469,13 +579,6 @@ class TestVpcIgnoreFieldDrift:
         # ...and the declared value is retained in the CR spec (retain semantics).
         latest = k8s.get_resource(ref)
         assert latest["spec"].get("enableDNSSupport") is True
-
-        # The resource stays Synced even though spec (true) differs from the live
-        # attribute (false).
-        assert k8s.wait_on_condition(
-            ref, "ACK.ResourceSynced", "True",
-            wait_periods=6, period_length=10,
-        )
 
     @pytest.mark.parametrize(
         "ignore_field_drift_vpc",
@@ -512,24 +615,36 @@ class TestVpcIgnoreFieldDrift:
         assert _user_tags(ec2_validator.get_vpc(vpc_id)).get("team") == "payments"
         condition.assert_synced(ref)
 
+        synced_before = condition.get_synced_last_transition_time(ref)
+        assert synced_before is not None
+
         # An external actor overwrites the VALUE of the declared tag key, rather
         # than adding a new key.
         ec2_client.create_tags(
             Resources=[vpc_id],
             Tags=[{"Key": "team", "Value": "external-override"}],
         )
-        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
 
-        # The externally-changed value must survive: ACK does not revert a
-        # declared key's value back to the spec value (payments).
+        # Precondition: the overwrite is visible on AWS before the controller
+        # looks, so a race with CreateTags cannot make this pass for the wrong
+        # reason.
+        assert _user_tags(
+            ec2_validator.get_vpc(vpc_id)
+        ).get("team") == "external-override", (
+            "out-of-band CreateTags did not overwrite the declared tag value"
+        )
+
+        # Nothing else will make the controller look (10h resync, no watch event).
+        # This also asserts it stays Synced even though the spec tag value
+        # (payments) differs from the live value (external-override).
+        _force_reconcile_after(
+            ref, synced_before, "the declared tag value was overwritten",
+        )
+
+        # Only now is this meaningful: the controller examined the resource and
+        # declined to revert the declared key's value back to the spec value --
+        # the case tags.Sync would actively undo.
         assert _user_tags(ec2_validator.get_vpc(vpc_id)).get("team") == "external-override", (
             "controller reverted an externally-changed tag value despite "
             "ignore-field-drift on spec.tags"
-        )
-
-        # The resource stays Synced even though the spec tag value (payments)
-        # differs from the live value (external-override).
-        assert k8s.wait_on_condition(
-            ref, "ACK.ResourceSynced", "True",
-            wait_periods=6, period_length=10,
         )
